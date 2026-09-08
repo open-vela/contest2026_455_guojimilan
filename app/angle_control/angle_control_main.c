@@ -73,6 +73,7 @@ extern void board_userled(int led, bool on);
 #define DCC101_STEPS_90DEG  4096            /* 16384步/圈 * 90/360 */
 #define DCC101_STEPS_PER_DEG  (4096 / 90)   /* 约45.5步/度 */
 #define LID_MAX_DEG         90              /* 翻盖行程限幅: 0~90 度 */
+#define LID_AUTOCLOSE_US    (60UL * 1000000UL)  /* 开盖60秒无操作自动合盖(阈值主动) */
 
 static int g_mfd = -1;    /* 电机串口句柄, motor_init() 打开 */
 
@@ -705,6 +706,7 @@ int angle_control_main(int argc, char *argv[])
       static int hb = 0;
       static int hb_cnt = 0;
       static int lid_deg = 0;          /* 翻盖当前角度: 0=全收, 90=全开 */
+      static unsigned long lid_open_us = 0;  /* 最近一次开盖时刻(0=盖是合的) */
 
       /* ---- LED 心跳: 每 ~2 圈翻转一次, 证明主循环活着 ---- */
       if (++hb_cnt >= 2)
@@ -734,6 +736,17 @@ int angle_control_main(int argc, char *argv[])
                   motor_send_angle(dir, steps);
                 }
               lid_deg = target;
+              if (target >= 45)
+                {
+                  struct timespec ts;
+                  clock_gettime(CLOCK_MONOTONIC, &ts);
+                  lid_open_us = (unsigned long)ts.tv_sec * 1000000UL
+                                + ts.tv_nsec / 1000UL;
+                }
+              else
+                {
+                  lid_open_us = 0;
+                }
               oled_show_status(lid_deg);
               printf("GD32:lid %s (%d deg)\r\n",
                      (lid_deg >= 45) ? "open" : "close", lid_deg);
@@ -741,6 +754,32 @@ int angle_control_main(int argc, char *argv[])
                 {
                   usleep(20 * 1000);
                 }
+            }
+        }
+
+      /* ---- 主动保护(阈值主动场景): 开盖 60 秒无操作自动合盖 ----
+       * 无论按键还是 Agent 指令开的盖, 超时未合都自动收回,
+       * 防异味/防宠物翻垃圾; 合盖动作上报串口, Agent 侧可据此
+       * 主动通知用户"盖子已自动关闭" */
+      if (lid_deg >= 45 && lid_open_us != 0)
+        {
+          struct timespec ts;
+          unsigned long now_us;
+
+          clock_gettime(CLOCK_MONOTONIC, &ts);
+          now_us = (unsigned long)ts.tv_sec * 1000000UL + ts.tv_nsec / 1000UL;
+          if (now_us - lid_open_us > LID_AUTOCLOSE_US)
+            {
+              int diff = 0 - lid_deg;
+              uint16_t steps = (uint16_t)(-diff) * DCC101_STEPS_PER_DEG;
+              if (steps > 0 && g_mfd >= 0)
+                {
+                  motor_send_angle(0x00, steps);    /* 逆时针合盖 */
+                }
+              lid_deg = 0;
+              lid_open_us = 0;
+              oled_show_status(0);
+              printf("GD32:lid auto-close (60s timeout)\r\n");
             }
         }
 
@@ -771,7 +810,48 @@ int angle_control_main(int argc, char *argv[])
                       unsigned long now_us;
 
                       line[line_len] = '\0';
-                      if (parse_ball_frame(line, &x, &y))
+
+                      /* ---- AI Agent 翻盖控制帧: "L,<deg>" ----
+                       * 与 K230 的 "B,x,y" 坐标帧共用 USART0, 用帧头区分。
+                       * deg>=45 视为开盖(90), 其余合盖(0)。
+                       * Agent 侧示例: echo "L,90" > /dev/ttyS0 */
+                      if (line[0] == 'L')
+                        {
+                          int deg = -1;
+                          if (sscanf(line, "L,%d", &deg) == 1)
+                            {
+                              int target = (deg >= 45) ? LID_MAX_DEG : 0;
+                              int diff = target - lid_deg;
+                              if (diff != 0)
+                                {
+                                  uint8_t dir = (diff > 0) ? 0x01 : 0x00;
+                                  uint16_t steps =
+                                    (uint16_t)(diff < 0 ? -diff : diff)
+                                    * DCC101_STEPS_PER_DEG;
+                                  if (steps > 0 && g_mfd >= 0)
+                                    {
+                                      motor_send_angle(dir, steps);
+                                    }
+                                  lid_deg = target;
+                                  if (target >= 45)
+                                    {
+                                      clock_gettime(CLOCK_MONOTONIC, &ts);
+                                      lid_open_us =
+                                        (unsigned long)ts.tv_sec * 1000000UL
+                                        + ts.tv_nsec / 1000UL;
+                                    }
+                                  else
+                                    {
+                                      lid_open_us = 0;
+                                    }
+                                  oled_show_status(lid_deg);
+                                  printf("GD32:lid %s (%d deg)\r\n",
+                                         (lid_deg >= 45) ? "open" : "close",
+                                         lid_deg);
+                                }
+                            }
+                        }
+                      else if (parse_ball_frame(line, &x, &y))
                         {
                           /* 有效帧：
                            *   x/y 坐标有效（>=0） -> LED 亮
