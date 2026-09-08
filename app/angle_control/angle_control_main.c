@@ -11,6 +11,9 @@
  *        - B,<x>,<y> -> 有效坐标，LED 点亮
  *      LED 即通信状态灯：常亮 = 正在收到有效目标坐标。
  *   3. 每 3 秒无任何有效帧则自动熄灭 LED（K230 断线保护）。
+ *   4. 用户按键(Wakeup键, PA0)：每按一次通过 USART1(/dev/ttyS1, PA2/PA3)
+ *      向 DCC-101 闭环步进电机发送"相对角度转动90度"命令(4096步)，
+ *      OLED 第二行显示累计转动次数。
  *
  * 接线（K230 -> GD32F470V-START）：
  *   K230 Pin9  (UART1_TX) -> PA10 (USART0_RX)
@@ -36,6 +39,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <termios.h>
+#include <poll.h>
 
 /* 板级 LED 原型：<nuttx/board.h> 里该声明被 CONFIG_ARCH_LEDS 宏包裹，
  * 本板未开该宏导致隐式声明告警，这里显式声明一次 */
@@ -54,6 +58,58 @@ extern void board_userled(int led, bool on);
 
 /* 无有效帧超时（微秒）：3 秒无目标则熄灯，防止 K230 断线后 LED 误亮 */
 #define RX_TIMEOUT_US       (3 * 1000 * 1000UL)
+
+/* ===================== DCC-101 步进电机(USART1) =====================
+ * 接线：GD32 PA2(USART1_TX) -> 电机 RX1
+ *       电机 VM/GND          -> 12V 独立供电, 信号 GND 与 GD32 共地
+ * 协议(与 23e 参考代码 BSP/bsp_dcc101.h 一致)：115200-8N1, 11字节帧
+ *   [0]=0xAA [1]=0x55 帧头
+ *   [2]=设备地址0x01 [3]=命令0x11(相对角度) [4]=数据长度0x05
+ *   [5]=方向(0x01顺/0x00逆) [6..7]=速度(0=默认) [8..9]=步数(小端)
+ *   [10]=校验和(Byte2..Byte9 累加和的低8位)
+ * 角度换算：16384步=360度 -> 90度=4096步 */
+#define MOTOR_UART_DEV      "/dev/ttyS1"    /* USART1: PA2=TX, PA3=RX */
+#define MOTOR_BAUDRATE      115200
+#define DCC101_STEPS_90DEG  4096            /* 16384步/圈 * 90/360 */
+#define DCC101_STEPS_PER_DEG  (4096 / 90)   /* 约45.5步/度 */
+#define LID_MAX_DEG         90              /* 翻盖行程限幅: 0~90 度 */
+
+static int g_mfd = -1;    /* 电机串口句柄, motor_init() 打开 */
+
+/* 组帧并发送"相对角度转动"命令
+ * dir: 0x01=顺时针 0x00=逆时针; steps: 步数(90度=4096) */
+static void motor_send_angle(uint8_t dir, uint16_t steps)
+{
+  uint8_t f[11];
+  uint8_t sum = 0;
+  int i;
+
+  f[0] = 0xAA;              /* 帧头高字节 */
+  f[1] = 0x55;              /* 帧头低字节 */
+  f[2] = 0x01;              /* 设备地址 */
+  f[3] = 0x11;              /* 命令: 相对角度运动 */
+  f[4] = 0x05;              /* 数据长度 */
+  f[5] = dir;               /* 方向 */
+  f[6] = 0x00;              /* 速度高字节: 0=默认速度 */
+  f[7] = 0x00;              /* 速度低字节 */
+  f[8] = (uint8_t)(steps & 0xFF);         /* 步数低字节 */
+  f[9] = (uint8_t)((steps >> 8) & 0xFF);  /* 步数高字节 */
+  for (i = 2; i <= 9; i++)
+    {
+      sum += f[i];          /* 校验和 = Byte2..Byte9 累加 */
+    }
+  f[10] = sum;
+
+  if (g_mfd >= 0)
+    {
+      write(g_mfd, f, sizeof(f));   /* 11 字节一次性发出 */
+    }
+}
+
+/* ===================== 用户按键 PB12(寄存器级) =====================
+ * 板载 PA0(User Key) 在 NuttX 下读不到电平变化(裸机正常, 原因未明),
+ * 改用外接按键模块: S->PB12, GND->GND, 内部上拉, 按下=低电平。
+ * 注意: GPIOB 寄存器宏在下方 OLED 段定义, 按键代码移到那里之后 */
 
 /* ===================== 工具函数 ===================== */
 
@@ -184,6 +240,22 @@ static uint8_t g_oled_addr = 0x3c;
 #define SDA_HIGH()       (GPIOB_OCTL |=  (1U << 7))
 #define SDA_LOW()        (GPIOB_OCTL &= ~(1U << 7))
 #define SDA_READ()       ((GPIOB_ISTAT >> 7) & 1U)
+
+/* ===================== 用户按键 PB12(寄存器级) =====================
+ * 板载 PA0(User Key) 在 NuttX 下读不到电平变化(裸机正常, 原因未明),
+ * 改用外接按键模块: S->PB12, GND->GND(模块 VCC 不接), 芯片内部上拉。
+ * 没按下 = 高电平, 按下 = 低电平。PB12 在 CTL/PUD 寄存器的 bit25:24 */
+static void key_init(void)
+{
+  GPIOB_CTL &= ~(0x3U << 24);                              /* PB12 = 输入 */
+  GPIOB_PUD = (GPIOB_PUD & ~(0x3U << 24)) | (0x1U << 24);  /* PB12 = 上拉 */
+}
+
+/* 返回 1 = 按下(低电平) */
+static int key_down(void)
+{
+  return ((GPIOB_ISTAT & (1U << 12)) == 0U) ? 1 : 0;
+}
 
 /* 粗略微秒延时: 主频 200MHz 下 40 个 NOP 约等于 1us。
  * I2C 对时序精度要求宽松(只慢不快就行), 无需精确定时器 */
@@ -326,6 +398,7 @@ static const struct oled_font5x7 g_font[] =
 {
   { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00 } },
   { '!', { 0x00, 0x00, 0x5F, 0x00, 0x00 } },
+  { ':', { 0x00, 0x36, 0x36, 0x00, 0x00 } },
   { '0', { 0x3E, 0x51, 0x49, 0x45, 0x3E } },
   { '1', { 0x00, 0x42, 0x7F, 0x40, 0x00 } },
   { '2', { 0x42, 0x61, 0x51, 0x49, 0x46 } },
@@ -356,6 +429,17 @@ static const struct oled_font5x7 g_font[] =
   { 'W', { 0x3F, 0x40, 0x38, 0x40, 0x3F } },
   { 'X', { 0x63, 0x14, 0x08, 0x14, 0x63 } },
   { 'Y', { 0x07, 0x48, 0x30, 0x08, 0x07 } },
+  { 'B', { 0x7F, 0x49, 0x49, 0x49, 0x36 } },
+  { 'C', { 0x3E, 0x41, 0x41, 0x41, 0x22 } },
+  { 'F', { 0x7F, 0x09, 0x09, 0x09, 0x01 } },
+  { 'J', { 0x30, 0x40, 0x40, 0x3F, 0x1F } },
+  { 'Q', { 0x1E, 0x21, 0x21, 0x61, 0x5E } },
+  { 'Z', { 0x61, 0x51, 0x49, 0x45, 0x43 } },
+  { 'v', { 0x0F, 0x10, 0x20, 0x10, 0x0F } },
+  { 'x', { 0x63, 0x14, 0x08, 0x14, 0x63 } },
+  { 'y', { 0x4F, 0x50, 0x50, 0x3F, 0x0F } },
+  { '-', { 0x08, 0x08, 0x08, 0x08, 0x08 } },
+  { '.', { 0x00, 0x00, 0x00, 0x60, 0x00 } },
 };
 #define OLED_FONT_N (sizeof(g_font) / sizeof(g_font[0]))
 
@@ -495,7 +579,7 @@ static void oled_test(void)
           {
             line[j] = 0x00;
           }
-        oled_render_line(line, "NUTTX OLED OK!");
+        oled_render_line(line, "VM FLASH OK v2");
         page[0] = 0x40;
         for (j = 0; j < 128; j++)
           {
@@ -517,6 +601,29 @@ static void oled_test(void)
           board_userled(0, false); usleep(500 * 1000);
         }
     }
+}
+
+/****************************************************************************
+ * oled_show_status()
+ * OLED 状态显示(第2行): "LID:OPEN 90" / "LID:CLOSE 0"
+ * lid_deg: 翻盖当前角度(0=全收, 90=全开)
+ * 只重写一页, 不清整屏, 刷新快无闪烁。
+ ****************************************************************************/
+static void oled_show_status(int lid_deg)
+{
+  uint8_t page[129];
+  uint8_t line[128];
+  char text[24];
+  int j;
+
+  snprintf(text, sizeof(text), "LID:%s %d",
+           (lid_deg >= 45) ? "OPEN " : "CLOSE", lid_deg);
+  for (j = 0; j < 128; j++) { line[j] = 0x00; }
+  oled_render_line(line, text);
+  page[0] = 0x40;
+  for (j = 0; j < 128; j++) { page[j + 1] = line[j]; }
+  oled_set_pos(1, 0);
+  i2c_write_buf(page, 129);
 }
 
 /* ===================== 主入口 ===================== */
@@ -569,6 +676,25 @@ int angle_control_main(int argc, char *argv[])
   /* ---- OLED 点亮测试 ---- */
   oled_test();
 
+  /* ---- DCC-101 电机串口(USART1)初始化 ----
+   * 打不开不算致命: 电机可能没接, 按键仍有效只是发不出帧 */
+  g_mfd = open(MOTOR_UART_DEV, O_RDWR);
+  if (g_mfd < 0)
+    {
+      printf("GD32:motor uart open failed\r\n");   /* 按键仍有效, 但发不出帧 */
+    }
+  else
+    {
+      uart_set_baudrate(g_mfd, MOTOR_BAUDRATE);   /* 115200 匹配 DCC-101 */
+      printf("GD32:motor uart ready\r\n");
+    }
+
+  /* ---- 用户按键(PB12)初始化 ---- */
+  key_init();
+
+  /* OLED 第二行显示初始翻盖状态 */
+  oled_show_status(0);
+
   /* 起始时间基准：0 表示还没收到过任何有效帧，超时保护不触发 */
   last_valid_us = 0;
 
@@ -576,9 +702,57 @@ int angle_control_main(int argc, char *argv[])
     {
       char buf[16];
       ssize_t n;
+      static int hb = 0;
+      static int hb_cnt = 0;
+      static int lid_deg = 0;          /* 翻盖当前角度: 0=全收, 90=全开 */
 
-      /* ---- 收数据：每次最多读 16 字节，循环拼行 ---- */
-      n = read(fd, buf, sizeof(buf));
+      /* ---- LED 心跳: 每 ~2 圈翻转一次, 证明主循环活着 ---- */
+      if (++hb_cnt >= 2)
+        {
+          hb_cnt = 0;
+          hb = !hb;
+          board_userled(0, hb);
+        }
+
+      /* ---- 用户按键: 按一下 = 翻盖全开/全收(0<->90 切换) ----
+       * 消抖: 检测到低电平后延时 30ms 再确认; 触发后等待松手,
+       * 保证"一次按压只发一次命令"。按住期间主循环暂停收包,
+       * K230 帧会暂存在串口接收缓冲(252字节), 松手后继续处理
+       * 方向协议: 0x01=顺时针(开盖), 0x00=逆时针(收盖) */
+      if (key_down())
+        {
+          usleep(30 * 1000);              /* 消抖延时 */
+          if (key_down())
+            {
+              int target = (lid_deg >= 45) ? 0 : LID_MAX_DEG;
+              int diff = target - lid_deg;
+              uint8_t dir = (diff > 0) ? 0x01 : 0x00;
+              uint16_t steps = (uint16_t)(diff < 0 ? -diff : diff)
+                               * DCC101_STEPS_PER_DEG;
+              if (steps > 0)
+                {
+                  motor_send_angle(dir, steps);
+                }
+              lid_deg = target;
+              oled_show_status(lid_deg);
+              printf("GD32:lid %s (%d deg)\r\n",
+                     (lid_deg >= 45) ? "open" : "close", lid_deg);
+              while (key_down())          /* 等待松手 */
+                {
+                  usleep(20 * 1000);
+                }
+            }
+        }
+
+      /* ---- 收数据：poll 带 50ms 超时 + read ----
+       * NuttX 串口驱动的 VMIN/VTIME 超时不可靠, 裸 read() 在无数据时会
+       * 永久阻塞, 导致主循环卡死(按键/OLED 全部无响应)。
+       * poll() 由驱动可靠支持, 超时返回 0, 保证循环恒定节拍 */
+      struct pollfd pfd;
+      pfd.fd      = fd;
+      pfd.events  = POLLIN;
+      pfd.revents = 0;
+      n = (poll(&pfd, 1, 50) > 0) ? read(fd, buf, sizeof(buf)) : 0;
       if (n > 0)
         {
           for (ssize_t i = 0; i < n; i++)
